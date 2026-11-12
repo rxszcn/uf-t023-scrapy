@@ -123,6 +123,14 @@ the items of the resumed run: ``"append"`` adds them to those feeds,
 ``"overwrite"`` replaces the items of the previous run with them, and
 ``"create"`` does not write them anywhere.
 
+For :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` batched feeds, the batch that was
+being written when the previous run stopped is continued instead: the
+``"append"`` and ``"overwrite"`` modes keep writing into its existing file
+without losing its items, while the ``"create"`` mode leaves that file
+untouched and moves the resumed run to the next batch ID. If the previous run
+was killed before saving its state, the next batch ID is inferred from the
+batch files already on disk when using the local filesystem storage.
+
 Cookie expiration
 -----------------
 

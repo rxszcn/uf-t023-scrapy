@@ -707,6 +707,24 @@ would have contained are lost.
     previous run already exists, so a feed that must survive a resumed crawl
     needs the ``"append"`` mode.
 
+When a batched crawl (see :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`) is resumed,
+the batch that the previous run was writing when it stopped is handled
+according to its mode instead of being treated as a new target:
+
+-   ``"append"`` keeps writing into the existing batch file.
+
+-   ``"overwrite"`` also keeps writing into it, so the items already stored in
+    that batch are not truncated away.
+
+-   ``"create"`` leaves the existing batch file untouched and starts the
+    resumed crawl with the following batch ID, so no item is written to an
+    existing file and the batch numbering stays consistent.
+
+If the previous run was killed before it could save its state, the next batch
+ID is inferred, for the :ref:`local filesystem <topics-feed-storage-fs>`
+storage, from the batch files already on disk, so the numbering does not
+restart at 1 and mix the data of the two runs.
+
 .. setting:: FEED_STORE_EMPTY
 
 FEED_STORE_EMPTY

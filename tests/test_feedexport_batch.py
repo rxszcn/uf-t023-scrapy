@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest import mock
@@ -12,7 +14,12 @@ from packaging.version import Version
 import scrapy
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
-from scrapy.extensions.feedexport import FeedExporter, FeedSlot, S3FeedStorage
+from scrapy.extensions.feedexport import (
+    FeedExporter,
+    FeedSlot,
+    FileFeedStorage,
+    S3FeedStorage,
+)
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.test import get_crawler
 from tests.spiders import ItemSpider
@@ -531,3 +538,384 @@ class TestBatchDeliveries:
             assert call.kwargs["Bucket"] == bucket
         assert crawler.stats
         assert crawler.stats.get_value("feedexport/success_count/S3FeedStorage") == 3
+
+
+def _batch_lines(path: Path) -> list[list[str]]:
+    """Return the JSON Lines items of every batch file in *path*, ordered by
+    file name."""
+    return [
+        [line for line in file.read_text().splitlines() if line]
+        for file in sorted(path.iterdir())
+    ]
+
+
+class _NoAppendFileStorage(FileFeedStorage):
+    """File storage that can report an existing target but cannot append to
+    it, like a remote storage without an append operation."""
+
+    supported_modes = frozenset({"create", "overwrite"})
+
+
+class _InMemoryStorage:
+    """Minimal storage without a filesystem path, so the on-disk batch ID
+    scan cannot inspect it."""
+
+    supported_modes = frozenset({"append", "create", "overwrite"})
+
+    def __init__(self, uri: str, *, feed_options: dict[str, Any] | None = None):
+        self.uri = uri
+
+    def open(self, spider):
+        return BytesIO()
+
+    def store(self, file):
+        file.close()
+
+
+class TestResumeModes:
+    """How the feed mode interacts with resuming a batched crawl.
+
+    Each crawl uses a batch size of 2: the first crawl leaves a full batch 1
+    and a partial batch 2, and the resumed crawl must handle that partial
+    batch according to its mode without losing items or restarting the batch
+    numbering.
+    """
+
+    @staticmethod
+    async def _crawl(
+        mockserver: MockServer,
+        feed_dir: Path,
+        jobdir: Path,
+        items: Iterable[Any],
+        mode: str | None,
+    ) -> None:
+        settings = {
+            "FEEDS": {
+                build_url(feed_dir / "%(batch_id)d.jl"): {
+                    "format": "jsonlines",
+                    "mode": mode,
+                }
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(jobdir),
+        }
+        await crawl_items(mockserver, items, settings)
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [
+            pytest.param(
+                "append",
+                [
+                    ['{"foo": "bar1"}', '{"foo": "bar2"}'],
+                    ['{"foo": "bar3"}', '{"foo": "bar4"}', '{"foo": "bar5"}'],
+                ],
+                id="append",
+            ),
+            pytest.param(
+                "overwrite",
+                [
+                    ['{"foo": "bar1"}', '{"foo": "bar2"}'],
+                    ['{"foo": "bar3"}', '{"foo": "bar4"}', '{"foo": "bar5"}'],
+                ],
+                id="overwrite",
+            ),
+            pytest.param(
+                "create",
+                [
+                    ['{"foo": "bar1"}', '{"foo": "bar2"}'],
+                    ['{"foo": "bar3"}'],
+                    ['{"foo": "bar4"}', '{"foo": "bar5"}'],
+                ],
+                id="create",
+            ),
+        ],
+    )
+    @coroutine_test
+    async def test_resume_partial_batch(
+        self,
+        mode: str,
+        expected: list[list[str]],
+        mockserver: MockServer,
+        tmp_path: Path,
+    ) -> None:
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}],
+            mode,
+        )
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar4"}, {"foo": "bar5"}],
+            mode,
+        )
+        assert _batch_lines(feed_dir) == expected
+
+    @pytest.mark.parametrize("mode", ["append", "overwrite", "create"])
+    @coroutine_test
+    async def test_resume_batch_numbering(
+        self, mode: str, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A resumed crawl never reuses a batch ID, whatever the mode."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}],
+            mode,
+        )
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar4"}, {"foo": "bar5"}, {"foo": "bar6"}, {"foo": "bar7"}],
+            mode,
+        )
+        # Every batch file name holds a unique, 1-based and gap-free batch ID.
+        names = [path.name for path in feed_dir.iterdir()]
+        ids = sorted(int(name.removesuffix(".jl")) for name in names)
+        assert ids == list(range(1, len(ids) + 1))
+        assert len(names) == len(set(names))
+
+    @pytest.mark.parametrize("mode", ["append", "overwrite", "create"])
+    @coroutine_test
+    async def test_resume_after_hard_kill(
+        self, mode: str, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """When spider.state was never written, the batch ID is inferred from
+        the batch files on disk instead of restarting at 1, which would mix
+        the data of the two runs in the same files."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [
+                {"foo": "bar1"},
+                {"foo": "bar2"},
+                {"foo": "bar3"},
+                {"foo": "bar4"},
+            ],
+            mode,
+        )
+        # A hard kill prevents spider.state from being written, while the full
+        # batch files have already been delivered.
+        (jobdir / "spider.state").unlink()
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar5"}, {"foo": "bar6"}],
+            mode,
+        )
+        assert _batch_lines(feed_dir) == [
+            ['{"foo": "bar1"}', '{"foo": "bar2"}'],
+            ['{"foo": "bar3"}', '{"foo": "bar4"}'],
+            ['{"foo": "bar5"}', '{"foo": "bar6"}'],
+        ]
+
+    @coroutine_test
+    async def test_resume_after_hard_kill_no_batches(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """Without state or batch file on disk, the inferred batch ID is 1."""
+        feed_dir = unique_path(tmp_path)
+        feed_dir.mkdir()
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        await self._crawl(mockserver, feed_dir, jobdir, [{"foo": "bar1"}], "append")
+        assert _batch_lines(feed_dir) == [['{"foo": "bar1"}']]
+
+    @coroutine_test
+    async def test_resume_after_hard_kill_batch_time_template(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """The batch ID is inferred even when the file name also contains the
+        batch time placeholder, which resolves to a different value per run."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        template = build_url(feed_dir / "_%(batch_time)s_%(batch_id)d.jl")
+        settings = {
+            "FEEDS": {template: {"format": "jsonlines", "mode": "append"}},
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(jobdir),
+        }
+        await crawl_items(
+            mockserver,
+            [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}],
+            settings,
+        )
+        (jobdir / "spider.state").unlink()
+        await crawl_items(mockserver, [{"foo": "bar4"}], settings)
+        files = list(feed_dir.iterdir())
+        ids = sorted(int(path.stem.rsplit("_", 1)[1]) for path in files)
+        assert ids == [1, 2, 3]
+        last = max(files, key=lambda path: int(path.stem.rsplit("_", 1)[1]))
+        assert last.read_text().strip() == '{"foo": "bar4"}'
+
+    @coroutine_test
+    async def test_resume_exact_batch_boundary(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """When the previous run ended exactly on a full batch, the resumed
+        target does not exist yet, so a new batch file is opened normally."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar1"}, {"foo": "bar2"}],
+            "append",
+        )
+        await self._crawl(mockserver, feed_dir, jobdir, [{"foo": "bar3"}], "append")
+        assert _batch_lines(feed_dir) == [
+            ['{"foo": "bar1"}', '{"foo": "bar2"}'],
+            ['{"foo": "bar3"}'],
+        ]
+
+    @coroutine_test
+    async def test_resume_after_hard_kill_non_file_storage(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A storage without a filesystem path cannot be scanned for existing
+        batches, so the crawl starts at batch 1 instead of failing."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        settings = {
+            "FEEDS": {
+                f"memory://{feed_dir}/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "mode": "append",
+                }
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "FEED_STORAGES": {"memory": _InMemoryStorage},
+            "JOBDIR": str(jobdir),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}], settings)
+        (jobdir / "spider.state").unlink()
+        crawler = await crawl_items(mockserver, [{"foo": "bar2"}], settings)
+        exporter = next(
+            extension
+            for extension in crawler.extensions.middlewares
+            if isinstance(extension, FeedExporter)
+        )
+        [slot] = exporter.slots
+        assert slot.batch_id == 1
+
+    @coroutine_test
+    async def test_resume_after_hard_kill_without_batch_id_placeholder(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A feed URI without a batch ID placeholder has nothing to infer an
+        ID from, so the single target keeps its batch ID of 1."""
+        feed_path = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        settings = {
+            "FEEDS": {build_url(feed_path): {"format": "jsonlines", "mode": "append"}},
+            "JOBDIR": str(jobdir),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}], settings)
+        (jobdir / "spider.state").unlink()
+        crawler = await crawl_items(mockserver, [{"foo": "bar2"}], settings)
+        exporter = next(
+            extension
+            for extension in crawler.extensions.middlewares
+            if isinstance(extension, FeedExporter)
+        )
+        [slot] = exporter.slots
+        assert slot.batch_id == 1
+
+    @coroutine_test
+    async def test_resume_create_keeps_partial_batch_untouched(
+        self, mockserver: MockServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """In the 'create' mode the partial batch of the previous run is left
+        exactly as it was, and the resumed run writes the following batches."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}],
+            "create",
+        )
+        partial = (feed_dir / "2.jl").read_bytes()
+        with caplog.at_level(logging.ERROR):
+            await self._crawl(
+                mockserver,
+                feed_dir,
+                jobdir,
+                [{"foo": "bar4"}, {"foo": "bar5"}],
+                "create",
+            )
+        assert (feed_dir / "2.jl").read_bytes() == partial
+        assert "because it already exists" not in caplog.text
+
+    @coroutine_test
+    async def test_resume_overwrite_does_not_truncate(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """The 'overwrite' mode must not truncate the partial batch that the
+        previous run was writing when it stopped."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}],
+            "overwrite",
+        )
+        await self._crawl(
+            mockserver,
+            feed_dir,
+            jobdir,
+            [{"foo": "bar4"}],
+            "overwrite",
+        )
+        assert _batch_lines(feed_dir) == [
+            ['{"foo": "bar1"}', '{"foo": "bar2"}'],
+            ['{"foo": "bar3"}', '{"foo": "bar4"}'],
+        ]
+
+
+class TestResumeStorageWithoutAppend:
+    @coroutine_test
+    async def test_resume_overwrite_storage_without_append(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """When a storage cannot append, the resumed crawl keeps its configured
+        mode instead of failing while trying to rebuild it for appending."""
+        feed_dir = unique_path(tmp_path)
+        jobdir = tmp_path / "job"
+        settings = {
+            "FEEDS": {
+                build_url(feed_dir / "%(batch_id)d.jl"): {
+                    "format": "jsonlines",
+                    "mode": "overwrite",
+                }
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "FEED_STORAGES": {"file": _NoAppendFileStorage},
+            "JOBDIR": str(jobdir),
+        }
+        await crawl_items(
+            mockserver, [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}], settings
+        )
+        await crawl_items(mockserver, [{"foo": "bar4"}], settings)
+        assert _batch_lines(feed_dir) == [
+            ['{"foo": "bar1"}', '{"foo": "bar2"}'],
+            ['{"foo": "bar4"}'],
+        ]

@@ -185,6 +185,17 @@ class FeedStorageProtocol(Protocol):
            This method may now be a coroutine function (``async def``).
         """
 
+    def exists(self) -> bool:
+        """Return whether the target of the feed already exists.
+
+        Storages that can detect an existing target before opening it (e.g. the
+        local filesystem storage) implement this so that a resumed crawl can
+        tell a batch of a previous run apart from a new one. Storages that can
+        only find out when the feed is delivered do not implement it, and
+        resumed batches are then handled by :meth:`open` and :meth:`store` as
+        usual.
+        """
+
     def store(
         self, file: IO[bytes]
     ) -> Coroutine[Any, Any, None] | Deferred[None] | None:
@@ -260,15 +271,17 @@ class FileFeedStorage:
 
     def __init__(self, uri: str, *, feed_options: dict[str, Any] | None = None):
         self.path: str = file_uri_to_path(uri) if uri.startswith("file:") else uri
-        self.write_mode: OpenBinaryMode = _WRITE_MODES[
-            _get_mode(self, feed_options, "append")
-        ]
+        self._mode: str = _get_mode(self, feed_options, "append")
+        self.write_mode: OpenBinaryMode = _WRITE_MODES[self._mode]
 
     def open(self, spider: Spider) -> IO[bytes]:
         dirname = Path(self.path).parent
         if dirname and not dirname.exists():
             dirname.mkdir(parents=True)
         return Path(self.path).open(self.write_mode)
+
+    def exists(self) -> bool:
+        return Path(self.path).exists()
 
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
         file.close()
@@ -780,46 +793,177 @@ class FeedExporter:
             )
 
     async def _on_state_loaded(self, state: dict[str, Any]) -> None:
-        """Update initial batch-1 slots with the correct resumed batch IDs.
+        """Resume batch numbering from the state saved by the previous run.
 
         Called via the spider_state_loaded signal after SpiderState has
         populated spider.state. Safe to mutate slots here because FeedSlot
         opens its file lazily; no I/O has occurred yet.
+
+        The saved ID of a feed is the 1-based ID of the next batch to write.
+        When the file of that batch is already on disk, the previous run died
+        while writing it, so its mode decides what happens: ``"append"`` keeps
+        writing into it, ``"create"`` leaves it untouched and moves the
+        resumed run to the next batch, and ``"overwrite"`` also keeps writing
+        into it instead of truncating the data that the previous run already
+        stored.
+
+        When no state was saved, e.g. because the previous run was killed
+        before it could write spider.state, the batch ID is inferred from the
+        batch files already on disk, so numbering does not restart at 1 and
+        mix new data with the files of the previous run.
         """
         feed_batch_ids: dict[str, int] = state.get("feed_batch_ids", {})
-        if feed_batch_ids:
-            spider = self.crawler.spider
-            assert spider is not None
-            for slot in self.slots:
-                saved_id = feed_batch_ids.get(slot.uri_template, 0)
-                if saved_id == 0:
-                    continue
-                batch_id = saved_id
-                uri_params = self._get_uri_params(
-                    spider, self.feeds[slot.uri_template]["uri_params"]
-                )
-                uri_params["batch_id"] = batch_id
-                uri = apply_uri_params(slot.uri_template, uri_params)
-                slot.batch_id = batch_id
-                slot.uri = uri
-                slot.storage = self._get_storage(uri, self.feeds[slot.uri_template])
+        spider = self.crawler.spider
+        assert spider is not None
+        for index, slot in enumerate(self.slots):
+            batch_id = feed_batch_ids.get(slot.uri_template)
+            if batch_id is None:
+                batch_id = self._resume_batch_id_from_disk(slot.uri_template)
+            if batch_id > 1:
+                self.slots[index] = self._resume_slot(slot, batch_id, spider)
         self._slots_initialized = True
+        await self._send_slots_initialized()
+
+    def _resume_slot(self, slot: FeedSlot, batch_id: int, spider: Spider) -> FeedSlot:
+        """Return the slot to use when a crawl resumes at *batch_id*.
+
+        When the target of *batch_id* is already on disk, the previous run
+        died while writing that batch: the ``"create"`` mode leaves it
+        untouched and starts the following batch, while the other modes keep
+        writing into it, with ``"overwrite"`` rebuilt to append so that the
+        data already stored is not truncated.
+        """
+        feed_options = self.feeds[slot.uri_template]
+        uri = self._resumed_batch_uri(spider, slot.uri_template, feed_options, batch_id)
+        storage = self._get_storage(uri, feed_options)
+        if self._target_exists(storage) and self._storage_mode(storage) == "create":
+            return self._start_new_batch(
+                batch_id=batch_id + 1,
+                uri=self._resumed_batch_uri(
+                    spider, slot.uri_template, feed_options, batch_id + 1
+                ),
+                feed_options=feed_options,
+                spider=spider,
+                uri_template=slot.uri_template,
+            )
+        slot.batch_id = batch_id
+        slot.uri = uri
+        if self._target_exists(storage):
+            storage = self._resume_storage(uri, feed_options, storage)
+        slot.storage = storage
+        return slot
+
+    def _resume_batch_id_from_disk(self, uri_template: str) -> int:
+        """Return the ID of the next batch to write when no state was saved.
+
+        A previous run that was killed before spider.state was written still
+        delivered its full batch files, so the highest batch ID found among
+        the files matching *uri_template* on disk gives the first ID that
+        nothing was written to yet. Only the local filesystem storage can be
+        inspected this way; other storages start at batch 1.
+        """
+        feed_options = self.feeds[uri_template]
+        storage = self._get_storage(uri_template, feed_options)
+        path = getattr(storage, "path", None)
+        if path is None:
+            return 1
+        parent = Path(path).parent
+        if not parent.is_dir():
+            return 1
+        # Match the batch file name: the batch ID placeholder captures the ID,
+        # the other placeholders (e.g. %(batch_time)s) may hold any value.
+        name = re.split(r"[\\/]", uri_template)[-1]
+        pattern_parts: list[str] = []
+        has_batch_id = False
+        last = 0
+        for placeholder in _FEED_URI_PLACEHOLDER_RE.finditer(name):
+            pattern_parts.append(re.escape(name[last : placeholder.start()]))
+            if placeholder.group(0).startswith("%(batch_id)"):
+                pattern_parts.append(r"(\d+)")
+                has_batch_id = True
+            else:
+                pattern_parts.append(".+?")
+            last = placeholder.end()
+        if not has_batch_id:
+            return 1
+        pattern_parts.append(re.escape(name[last:]))
+        pattern = re.compile("".join(pattern_parts))
+        batch_ids = []
+        for child in parent.iterdir():
+            child_match = pattern.fullmatch(child.name)
+            if child_match is not None:
+                batch_ids.append(int(child_match.group(1)))
+        return max(batch_ids, default=0) + 1
+
+    async def _send_slots_initialized(self) -> None:
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slots_initialized, slots=self.slots
         )
 
+    def _resumed_batch_uri(
+        self,
+        spider: Spider,
+        uri_template: str,
+        feed_options: dict[str, Any],
+        batch_id: int,
+    ) -> str:
+        uri_params = self._get_uri_params(spider, feed_options["uri_params"])
+        uri_params["batch_id"] = batch_id
+        return apply_uri_params(uri_template, uri_params)
+
+    @staticmethod
+    def _target_exists(storage: FeedStorageProtocol) -> bool:
+        exists = getattr(storage, "exists", None)
+        if exists is None:
+            # Storages with delayed delivery cannot report the target state
+            # before opening; conflicts are handled when the feed is stored.
+            return False
+        return bool(exists())
+
+    @staticmethod
+    def _storage_mode(storage: FeedStorageProtocol) -> str:
+        # Every built-in storage resolves its mode into a _mode attribute when
+        # it is built; storages of third-party code that predate the mode feed
+        # option are treated as appending, the historical filesystem default.
+        return str(getattr(storage, "_mode", "append"))
+
+    def _resume_storage(
+        self,
+        uri: str,
+        feed_options: dict[str, Any],
+        storage: FeedStorageProtocol,
+    ) -> FeedStorageProtocol:
+        """Return a storage that appends to the existing target of *storage*.
+
+        Used to continue a batch that the previous run did not finish, so
+        resuming never destroys the data already written to it.
+        """
+        if self._storage_mode(storage) == "append":
+            return storage
+        resumed_options = {**feed_options, "mode": "append"}
+        try:
+            return self._get_storage(uri, resumed_options)
+        except ValueError:
+            # The storage does not support appending (e.g. S3). It cannot
+            # continue the partial batch without destroying or rejecting it,
+            # so keep the configured storage and let its own mode handle the
+            # target when the feed is stored.
+            return storage
+
     async def _on_engine_started(self) -> None:
         if not self._slots_initialized:
             self._slots_initialized = True
-            await self.crawler.signals.send_catch_log_async(
-                signals.feed_slots_initialized, slots=self.slots
-            )
+            await self._send_slots_initialized()
 
     def _on_state_saving(self, state: dict[str, Any]) -> None:
-        """Persist the current batch ID for each feed into spider.state.
+        """Persist the next batch ID of each feed into spider.state.
 
         Called via the spider_state_saving signal before SpiderState writes
-        spider.state to disk, so the next run can resume from the right batch.
+        spider.state to disk, so the next run resumes from the right batch.
+        Full batches have already been delivered and removed from the slots,
+        so the batch ID of the remaining slot is always the one of the next
+        batch to write. Whether its target already holds data is discovered at
+        resume time, where the feed mode decides how to handle it.
         """
         feed_batch_ids = state.setdefault("feed_batch_ids", {})
         for slot in self.slots:
